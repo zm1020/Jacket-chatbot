@@ -71,56 +71,96 @@ NORMALIZE = {
 
 # Keep keywords domain-focused to reduce noise.
 DOMAIN_KEYWORDS = {
-    # protection / weather
-    "waterproof","water_resistant","water_repellent","wind_resistant","windproof",
-    "rain","storm","snow","cold","winter","breathable","reflective","seam_sealed","aquaguard",
 
-    # warmth cues
-    "down","down_filled","insulated","thermal","warmth","arctic","expedition","extreme_cold",
+    # =========================
+    # WEATHER / PROTECTION
+    # =========================
+    "waterproof", "water_resistant", "water_repellent",
+    "windproof", "wind_resistant",
+    "snow", "rain", "storm", "downpour",
+    "cold", "winter", "extreme_cold",
+    "breathable", "venting", "ventilation",
+    "seam_sealed", "fully_seam_sealed",
+    "storm_flap", "wind_guard",
+    "aquaguard", "reflective",
 
-    # materials / tech
-    "cordura","merino","wool","ripstop","nylon","polartec","tricot",
+    # =========================
+    # INSULATION / WARMTH
+    # =========================
+    "down", "down_filled", "insulated",
+    "thermal", "thermal_mapping",
+    "warmth", "arctic", "expedition",
+    "tei_1", "tei_2", "tei_3", "tei_4", "tei_5",
 
-    # use-case
-    "hiking","camping","kayaking","outdoor","city","travel","packable",
+    # =========================
+    # FABRIC / MATERIAL TECH
+    # =========================
+    "arctic_tech", "tri_durance", "cordura",
+    "merino", "merino_wool",
+    "ripstop", "nylon", "cotton",
+    "polartec", "power_stretch",
+    "tricot", "sueded_tricot",
+    "fur", "fur_ruff", "coyote_fur",
 
-    # trims / details people ask
-    "fur","coyote_fur","fur_ruff","snorkel_hood",
+    # =========================
+    # STRUCTURAL DESIGN
+    # =========================
+    "snorkel_hood", "helmet_compatible",
+    "adjustable_hood", "rib_knit_cuffs",
+    "two_way_zipper", "double_zipper",
+    "zipper", "drawcord",
+    "backpack_straps", "packable",
+    "recessed_cuffs",
 
-    # product types
-    "parka","jacket","vest","hoody","hoodie","shell","cap","beanie","accessory",
+    # =========================
+    # USE CASE / ACTIVITY
+    # =========================
+    "hiking", "camping", "outdoor",
+    "city", "urban", "travel",
+    "commute", "performance",
+    "active", "everyday",
+
+    # =========================
+    # PRODUCT TYPES
+    # =========================
+    "parka", "jacket", "vest",
+    "hoody", "hoodie", "shell",
+    "bomber", "coat",
+    "cap", "beanie", "accessory"
 }
 
 # phrase patterns -> keyword tokens
 PHRASES = {
-    # protection
-    r"\bfully seam[- ]sealed\b": "fully_seam_sealed",
-    r"\bseam[- ]sealed\b": "seam_sealed",
-    r"\baquaguard\b": "aquaguard",
-    r"\bstorm flap\b": "storm_flap",
-    r"\bmesh venting\b": "mesh_venting",
-    r"\bwind guard\b|\bwindguard\b": "wind_guard",
 
-    # warmth / insulation
+    # WEATHER
+    r"\bfully seam[- ]sealed\b": "fully_seam_sealed",
+    r"\bwater[- ]repellent\b": "water_repellent",
+    r"\bwater[- ]resistant\b": "water_resistant",
+    r"\bwind[- ]resistant\b": "wind_resistant",
+    r"\bstorm flap\b": "storm_flap",
+    r"\bwind guard\b": "wind_guard",
+
+    # INSULATION
     r"\bdown[- ]filled\b": "down_filled",
     r"\bthermal mapping\b": "thermal_mapping",
+    r"\bthermal experience index\b": "tei",
     r"\bextreme cold\b": "extreme_cold",
-    r"\barctic\b": "arctic",
-    r"\bexpedition\b": "expedition",
 
-    # portability
-    r"\bpackable into\b|\bpacks into\b": "packable",
-    r"\bbackpack straps\b": "backpack_straps",
-
-    # trims / details
-    r"\bfur ruff\b": "fur_ruff",
-    r"\bcoyote fur\b": "coyote_fur",
-    r"\bsnorkel hood\b": "snorkel_hood",
-    r"\brib[- ]knit cuffs?\b": "rib_knit_cuffs",
+    # MATERIAL
+    r"\barctic tech\b": "arctic_tech",
+    r"\btri[- ]durance\b": "tri_durance",
+    r"\bpower stretch\b": "power_stretch",
+    r"\bsueded tricot\b": "sueded_tricot",
     r"\bmerino wool\b": "merino_wool",
-    r"\bcordura\b": "cordura",
-}
 
+    # STRUCTURE
+    r"\bsnorkel hood\b": "snorkel_hood",
+    r"\bhelmet[- ]compatible\b": "helmet_compatible",
+    r"\bbackpack straps\b": "backpack_straps",
+    r"\btwo[- ]way zipper\b": "two_way_zipper",
+    r"\bdouble[- ]zipper\b": "double_zipper",
+    r"\brib[- ]knit cuffs?\b": "rib_knit_cuffs",
+}
 TEI_REGEX = re.compile(r"\bTEI\s*([1-5])\b", re.IGNORECASE)
 
 # DB helpers
@@ -192,7 +232,6 @@ def rebuild_keywords(conn: sqlite3.Connection, clear_existing: bool = True) -> N
 
         kws = extract_keywords(combined)
 
-        # insert each keyword row; TEI_level repeated per keyword (your schema)
         for kw in kws:
             cur.execute(
                 "INSERT OR IGNORE INTO product_keywords(product_id, keyword) VALUES (?, ?)",
