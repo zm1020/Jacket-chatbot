@@ -267,15 +267,25 @@ class ConversationState:
 def local_slot_fill(state: ConversationState, history: List[Dict[str, str]], user_msg: str) -> Dict[str, Any]:
     system = (
         "You are a slot-filling assistant for a jacket recommendation chatbot.\n"
-        "Extract preference info from the latest user message and update the state.\n"
-        "Return ONLY valid JSON (no extra text).\n"
-        "Use null if unknown or user does not want to provide information.\n"
+        "Your task is to extract structured preferences from the user's latest message.\n"
+        "Return ONLY valid JSON (no explanations or extra text).\n"
+        "If information is not mentioned, return null.\n\n"
+
         "Allowed values:\n"
         "- gender: men, women, unisex, null\n"
         "- use_case: school, travel, extreme_cold, rain, everyday, work, null\n"
-        "- tei: 1-5 or null\n"
-        "- waterproof/windproof: true/false/null\n"
-        "Extract a few short keywords (lowercase words).\n"
+        "- tei: 1,2,3,4,5 or null\n"
+        "- waterproof/windproof: true, false, or null\n\n"
+
+        "Keyword extraction rules:\n"
+        "- Extract up to 6 keywords describing the user's needs.\n"
+        "- Keywords should represent weather protection, insulation, material, activity, or product type.\n"
+        "- Prefer keywords from the domain vocabulary below.\n"
+        "- If the user uses similar wording (e.g., snowy, freezing, stormy), map it to the closest keyword.\n"
+        "- Do NOT invent new keywords outside the vocabulary.\n\n"
+
+        "Domain vocabulary:\n"
+        f"{', '.join(DOMAIN_KEYWORDS)}\n"
     )
 
     payload_obj = {
