@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from embedder import KeywordEmbedder, DOMAIN_KEYWORDS  # same folder import
@@ -64,7 +65,6 @@ def llm_generate(system: str, user_payload: str, *, max_new_tokens: int, tempera
         )
 
     text = _tokenizer.decode(out[0], skip_special_tokens=True)
-    # Best-effort: return tail (assistant answer). Works well enough for simple prompts.
     return text.split(user_payload, 1)[-1].strip()
 
 
@@ -134,9 +134,116 @@ class ScoredProduct:
     gender: str
 
 
-def retrieve_and_rank(
+@dataclass
+class ConversationState:
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    gender: Optional[str] = None
+    tei: Optional[int] = None
+    use_case: Optional[str] = None  # school/travel/extreme_cold/rain/everyday/work
+    waterproof: Optional[bool] = None
+    windproof: Optional[bool] = None
+    keywords: List[str] = field(default_factory=list)
+
+    asked_questions: List[str] = field(default_factory=list)
+    attempts: Dict[str, int] = field(default_factory=dict)
+
+    def bump_attempt(self, slot: str) -> int:
+        self.attempts[slot] = int(self.attempts.get(slot, 0)) + 1
+        return self.attempts[slot]
+
+    def missing_slots(self) -> List[str]:
+        missing: List[str] = []
+        if self.price_min is None and self.price_max is None:
+            missing.append("budget")
+        if self.gender is None:
+            missing.append("gender")
+        if self.use_case is None:
+            missing.append("use_case")
+        return missing
+
+
+class ProductDescriptionIndex:
+    """
+    Embeds existing product descriptions so ranking is not limited by sparse keyword overlap.
+    Uses its own SentenceTransformer instead of depending on KeywordEmbedder internals.
+    Requires the products table to have a description column.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        device: Optional[str] = None,
+    ):
+        self.conn = conn
+        self.model_name = model_name
+        self.device = device
+        self.encoder = SentenceTransformer(model_name, device=device)
+        self.product_ids: List[int] = []
+        self.product_texts: List[str] = []
+        self.product_embs = None
+        self._build()
+
+    def _encode_texts(self, texts: List[str]):
+        return self.encoder.encode(
+            texts,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=True,
+        )
+
+    def _build(self):
+        rows = self.conn.execute(
+            """
+            SELECT id, name, gender, description
+            FROM products
+            ORDER BY id
+            """
+        ).fetchall()
+
+        ids: List[int] = []
+        texts: List[str] = []
+
+        for row in rows:
+            text = build_product_text(row)
+            if not text:
+                continue
+            ids.append(int(row["id"]))
+            texts.append(text)
+
+        self.product_ids = ids
+        self.product_texts = texts
+        self.product_embs = self._encode_texts(texts) if texts else None
+
+    def search(self, query: str, top_k: int = 50) -> List[Tuple[int, float]]:
+        q = (query or "").strip()
+        if not q or self.product_embs is None or len(self.product_ids) == 0:
+            return []
+
+        q_emb = self._encode_texts([q])
+        sims = torch.matmul(q_emb, self.product_embs.T)[0]
+        vals, idxs = torch.topk(sims, k=min(top_k, len(self.product_ids)))
+
+        return [
+            (self.product_ids[idx], float(val))
+            for val, idx in zip(vals.tolist(), idxs.tolist())
+        ]
+
+
+def build_product_text(row: sqlite3.Row) -> str:
+    parts = [
+        str(row["name"] or ""),
+        str(row["gender"] or ""),
+        str(row["description"] or ""),
+    ]
+    return " ".join([p.strip().lower() for p in parts if p]).strip()
+
+
+def retrieve_and_rank_hybrid(
     conn: sqlite3.Connection,
     embedder: KeywordEmbedder,
+    desc_index: ProductDescriptionIndex,
     user_query: str,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
@@ -146,47 +253,53 @@ def retrieve_and_rank(
     top_per_product: int = 4,
     candidate_limit: int = 300,
     return_k: int = 5,
+    alpha: float = 0.35,  # keyword weight
+    beta: float = 0.65,   # description semantic weight
 ) -> Tuple[List[ScoredProduct], List[Tuple[str, float]]]:
     q = (user_query or "").strip().lower()
     if not q:
         return [], []
 
+    # -------------------------
+    # keyword score (coarse retrieval)
+    # -------------------------
     matches = embedder.match(q, top_k=top_keywords, threshold=kw_threshold)
-    if not matches:
-        return [], []
-
     kw_scores: Dict[str, float] = {to_canonical_kw(m.token): float(m.score) for m in matches}
 
-    query_kws_db: List[str] = []
-    for ck in kw_scores.keys():
-        query_kws_db.extend(to_db_variants(ck))
-    query_kws_db = list(dict.fromkeys(query_kws_db))
+    prod_kw_score: Dict[int, float] = defaultdict(float)
 
-    placeholders = ",".join(["?"] * len(query_kws_db))
-    kw_rows = conn.execute(
-        f"SELECT product_id, keyword FROM product_keywords WHERE keyword IN ({placeholders})",
-        query_kws_db,
-    ).fetchall()
+    if kw_scores:
+        query_kws_db: List[str] = []
+        for ck in kw_scores.keys():
+            query_kws_db.extend(to_db_variants(ck))
+        query_kws_db = list(dict.fromkeys(query_kws_db))
 
-    prod_scores = defaultdict(list)  # pid -> [scores...]
-    for pid, kw in kw_rows:
-        ck = to_canonical_kw(kw)
-        if ck in kw_scores:
-            prod_scores[int(pid)].append(kw_scores[ck])
+        if query_kws_db:
+            placeholders = ",".join(["?"] * len(query_kws_db))
+            kw_rows = conn.execute(
+                f"SELECT product_id, keyword FROM product_keywords WHERE keyword IN ({placeholders})",
+                query_kws_db,
+            ).fetchall()
 
-    if not prod_scores:
-        return [], [(k, kw_scores[k]) for k in kw_scores.keys()]
+            prod_scores = defaultdict(list)
+            for pid, kw in kw_rows:
+                ck = to_canonical_kw(kw)
+                if ck in kw_scores:
+                    prod_scores[int(pid)].append(kw_scores[ck])
 
-    scored_pids = []
-    for pid, scores in prod_scores.items():
-        scores.sort(reverse=True)
-        scored_pids.append((pid, sum(scores[:top_per_product])))
-    scored_pids.sort(key=lambda x: x[1], reverse=True)
-    scored_pids = scored_pids[:candidate_limit]
+            for pid, scores in prod_scores.items():
+                scores.sort(reverse=True)
+                prod_kw_score[pid] = sum(scores[:top_per_product])
 
-    candidate_ids = [pid for pid, _ in scored_pids]
+    # -------------------------
+    # description semantic score (distinguishes similar jackets)
+    # -------------------------
+    desc_hits = desc_index.search(q, top_k=candidate_limit)
+    prod_desc_score = {pid: score for pid, score in desc_hits}
+
+    candidate_ids = list(set(prod_kw_score.keys()) | set(prod_desc_score.keys()))
     if not candidate_ids:
-        return [], []
+        return [], sorted(kw_scores.items(), key=lambda x: x[1], reverse=True)
 
     id_placeholders = ",".join(["?"] * len(candidate_ids))
     where = [f"id IN ({id_placeholders})"]
@@ -211,81 +324,70 @@ def retrieve_and_rank(
         params,
     ).fetchall()
 
-    score_map = {pid: score for pid, score in scored_pids}
+    max_kw = max(prod_kw_score.values()) if prod_kw_score else 1.0
+    if max_kw == 0:
+        max_kw = 1.0
+
     products: List[ScoredProduct] = []
     for r in rows:
-        pid = int(r[0])
+        pid = int(r["id"])
+        kw_part = prod_kw_score.get(pid, 0.0) / max_kw
+        desc_part = prod_desc_score.get(pid, 0.0)
+        final_score = alpha * kw_part + beta * desc_part
+
         products.append(
             ScoredProduct(
                 id=pid,
-                score=float(score_map.get(pid, 0.0)),
-                name=r[1],
-                price=float(r[2]) if r[2] is not None else 0.0,
-                currency=r[3] or "",
-                url=r[4] or "",
-                gender=r[5] or "",
+                score=float(final_score),
+                name=r["name"],
+                price=float(r["price"]) if r["price"] is not None else 0.0,
+                currency=r["currency"] or "",
+                url=r["url"] or "",
+                gender=r["gender"] or "",
             )
         )
 
     products.sort(key=lambda p: p.score, reverse=True)
     products = products[:return_k]
 
-    matched_debug = sorted([(k, v) for k, v in kw_scores.items()], key=lambda x: x[1], reverse=True)
+    matched_debug = sorted(kw_scores.items(), key=lambda x: x[1], reverse=True)
     return products, matched_debug
 
 
 # -------------------------
 # LLM state + follow-up Qs
 # -------------------------
-@dataclass
-class ConversationState:
-    price_min: Optional[float] = None
-    price_max: Optional[float] = None
-    gender: Optional[str] = None
-    tei: Optional[int] = None
-    use_case: Optional[str] = None  # school/travel/extreme_cold/rain/everyday/work
-    waterproof: Optional[bool] = None
-    windproof: Optional[bool] = None
-    keywords: List[str] = field(default_factory=list)
-
-    asked_questions: List[str] = field(default_factory=list)
-    attempts: Dict[str, int] = field(default_factory=dict)
-
-    def bump_attempt(self, slot: str) -> int:
-        self.attempts[slot] = int(self.attempts.get(slot, 0)) + 1
-        return self.attempts[slot]
-
-    def missing_slots(self) -> List[str]:
-        missing: List[str] = []
-        if self.price_min is None and self.price_max is None:
-            missing.append("budget")
-        if self.use_case is None:
-            missing.append("use_case")
-        return missing
-
-
 def local_slot_fill(state: ConversationState, history: List[Dict[str, str]], user_msg: str) -> Dict[str, Any]:
     system = (
         "You are a slot-filling assistant for a jacket recommendation chatbot.\n"
-        "Your task is to extract structured preferences from the user's latest message.\n"
-        "Return ONLY valid JSON (no explanations or extra text).\n"
-        "If information is not mentioned, return null.\n\n"
+        "Extract preference info from the user's latest message.\n"
+        "Return ONLY valid JSON.\n"
+        "If a field is not mentioned, return null.\n\n"
+        "Asks as many questions as possible in one go, but do NOT repeat info already in current_state or ask about more than 6 fields at once.\n"
 
         "Allowed values:\n"
         "- gender: men, women, unisex, null\n"
         "- use_case: school, travel, extreme_cold, rain, everyday, work, null\n"
         "- tei: 1,2,3,4,5 or null\n"
-        "- waterproof/windproof: true, false, or null\n\n"
+        "- waterproof/windproof: true, false, null\n\n"
 
-        "Keyword extraction rules:\n"
-        "- Extract up to 6 keywords describing the user's needs.\n"
-        "- Keywords should represent weather protection, insulation, material, activity, or product type.\n"
-        "- Prefer keywords from the domain vocabulary below.\n"
-        "- If the user uses similar wording (e.g., snowy, freezing, stormy), map it to the closest keyword.\n"
-        "- Do NOT invent new keywords outside the vocabulary.\n\n"
+        "Keywords must come from the domain vocabulary below.\n"
+        "Do NOT invent new keywords.\n\n"
 
         "Domain vocabulary:\n"
-        f"{', '.join(DOMAIN_KEYWORDS)}\n"
+        f"{', '.join(DOMAIN_KEYWORDS)}\n\n"
+
+        "Output format example:\n"
+        "{\n"
+        '  "price_min": null,\n'
+        '  "price_max": 700,\n'
+        '  "gender": "men",\n'
+        '  "tei": 4,\n'
+        '  "use_case": "extreme_cold",\n'
+        '  "waterproof": true,\n'
+        '  "windproof": true,\n'
+        '  "keywords": ["snow", "down", "parka"]\n'
+        "}\n"
     )
 
     payload_obj = {
@@ -386,16 +488,27 @@ def local_generate_unique_question(state: ConversationState, missing_slot: str, 
 
 def build_final_query(state: ConversationState, user_msg: str) -> str:
     parts: List[str] = []
-    if state.keywords:
-        parts.extend(state.keywords[:8])
+
+    if state.gender:
+        parts.append(state.gender)
+
     if state.use_case:
-        parts.append(state.use_case)
+        parts.append(state.use_case.replace("_", " "))
+
+    if state.tei is not None:
+        parts.append(f"TEI {state.tei}")
+
     if state.waterproof is True:
         parts.append("waterproof")
     if state.windproof is True:
         parts.append("windproof")
+
+    if state.keywords:
+        parts.extend(state.keywords[:8])
+
     if user_msg:
         parts.append(user_msg.lower())
+
     return " ".join(parts)
 
 
@@ -410,6 +523,7 @@ def format_results(items: List[ScoredProduct]) -> str:
         lines.append(f"{i}) {p.name} — ${p.price:g} {p.currency} — score {p.score:.3f}\n   {p.url}")
     return "\n".join(lines)
 
+
 def map_llm_keywords_to_domain(
     embedder: KeywordEmbedder,
     llm_keywords: List[str],
@@ -418,7 +532,7 @@ def map_llm_keywords_to_domain(
 ) -> List[Tuple[str, float, str]]:
     """
     Returns list of (domain_kw, similarity, original_kw) for keywords that pass threshold.
-    Makes sure the keywords are mapped to the canonical domain keywords, so they can be used for retrieval. 
+    Makes sure the keywords are mapped to the canonical domain keywords, so they can be used for retrieval.
     The original LLM keywords are also returned for debugging.
     """
     mapped = []
@@ -429,7 +543,6 @@ def map_llm_keywords_to_domain(
         if not kw:
             continue
 
-        # match() expects text; here we feed the keyword itself
         hits = embedder.match(kw, top_k=1, threshold=sim_threshold)
         if not hits:
             continue
@@ -456,13 +569,15 @@ def main() -> None:
         keywords=DOMAIN_KEYWORDS,
     )
 
-    print("Draft Chatbot vLocal (Qwen slot-fill + unique follow-ups). Type 'quit' to exit.\n")
+    desc_index = ProductDescriptionIndex(conn)
+
+    print("Draft Chatbot vLocal (Qwen slot-fill + hybrid ranking with descriptions). Type 'quit' to exit.\n")
 
     state = ConversationState()
     history: List[Dict[str, str]] = []
 
     while True:
-        user = input("You: ").strip()
+        user = input("Tell me what you're looking for: ").strip()
         if not user:
             continue
         if user.lower() in {"quit", "exit"}:
@@ -470,22 +585,21 @@ def main() -> None:
 
         history.append({"role": "user", "content": user})
 
-        # LLM slot-fill; fallback to regex if LLM fails
         try:
             upd = local_slot_fill(state, history, user)
             merge_state(state, upd)
             mapped = map_llm_keywords_to_domain(emb, state.keywords, sim_threshold=0.6)
             state.keywords = [dk for (dk, sim, orig) in mapped]
 
-            print("LLM→Domain mapping:", [(orig, dk, round(sim, 3)) for (dk, sim, orig) in mapped]) # debug print for LLM keyword mapping
+            print("LLM→Domain mapping:", [(orig, dk, round(sim, 3)) for (dk, sim, orig) in mapped])
         except Exception:
-            pmin, pmax, gender = parse_filters(user)
+            pmin, pmax, parsed_gender = parse_filters(user)
             if pmin is not None:
                 state.price_min = pmin
             if pmax is not None:
                 state.price_max = pmax
-            if gender is not None:
-                state.gender = gender
+            if parsed_gender is not None:
+                state.gender = parsed_gender
 
         missing = state.missing_slots()
 
@@ -493,7 +607,6 @@ def main() -> None:
             slot = missing[0]
             tries = state.bump_attempt(slot)
 
-            # prevent infinite loops: after N tries, set safe default for use_case
             if slot == "use_case" and tries >= 3 and state.use_case is None:
                 state.use_case = "everyday"
                 missing = state.missing_slots()
@@ -504,13 +617,14 @@ def main() -> None:
                 print(f"Bot: {qtext}\n")
                 history.append({"role": "assistant", "content": qtext})
                 continue
-            
+        print("Bot: Searching for jackets...\n")
 
         final_query = build_final_query(state, user)
 
-        results, matched = retrieve_and_rank(
+        results, matched = retrieve_and_rank_hybrid(
             conn=conn,
             embedder=emb,
+            desc_index=desc_index,
             user_query=final_query,
             price_min=state.price_min,
             price_max=state.price_max,
@@ -520,6 +634,8 @@ def main() -> None:
             top_per_product=4,
             candidate_limit=300,
             return_k=5,
+            alpha=0.35,
+            beta=0.65,
         )
 
         print("Matched keywords:", [(k, round(s, 6)) for k, s in matched[:10]])
@@ -530,6 +646,7 @@ def main() -> None:
                 "price_max": state.price_max,
                 "gender": state.gender,
                 "use_case": state.use_case,
+                "tei": state.tei,
                 "waterproof": state.waterproof,
                 "windproof": state.windproof,
                 "keywords": state.keywords[:10],
@@ -543,3 +660,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
