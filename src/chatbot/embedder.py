@@ -1,8 +1,10 @@
 # This file embeds both product keywords and user queries
+# updated 3/10: now it embeds keywords + product descriptions, and matches user queries to both (for better recall)
 from __future__ import annotations
 
 import os
 import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -10,7 +12,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 # -------------------------
-# Your config (paste your latest)
+# Your config
 # -------------------------
 NORMALIZE: Dict[str, str] = {
     "water-resistant": "water_resistant",
@@ -91,20 +93,40 @@ DOMAIN_KEYWORDS = [
 ]
 
 # -------------------------
-# Embedder
+# Shared helpers
+# -------------------------
+
+def normalize_l2(x: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / norm
+
+
+def build_product_text(
+    name: Optional[str],
+    gender: Optional[str],
+    description: Optional[str],
+) -> str:
+    parts = [
+        str(name or "").strip().lower(),
+        str(gender or "").strip().lower(),
+        str(description or "").strip().lower(),
+    ]
+    return " ".join([p for p in parts if p]).strip()
+
+
+# -------------------------
+# Keyword embedder
 # -------------------------
 
 @dataclass(frozen=True)
 class KeywordMatch:
     token: str
-    score: float  # cosine similarity
+    score: float
 
 
 class KeywordEmbedder:
     """
     Pretrained embedder + cached keyword embeddings.
-    - build_cache(): computes embeddings for DOMAIN_KEYWORDS and saves to disk
-    - match(query): returns top-k semantically similar keywords (cosine similarity)
     """
     def __init__(
         self,
@@ -130,7 +152,6 @@ class KeywordEmbedder:
 
     @staticmethod
     def _token_to_text(token: str) -> str:
-        # better matching: "water_repellent" -> "water repellent"
         return token.replace("_", " ")
 
     def _cache_paths(self) -> Tuple[str, str]:
@@ -147,8 +168,11 @@ class KeywordEmbedder:
         self._kw_tokens = self.keywords
         self._kw_texts = [self._token_to_text(k) for k in self._kw_tokens]
 
-        emb = model.encode(self._kw_texts, convert_to_numpy=True, normalize_embeddings=True)
-        emb = emb.astype(np.float32)
+        emb = model.encode(
+            self._kw_texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ).astype(np.float32)
 
         meta = {
             "model_name": self.model_name,
@@ -166,7 +190,7 @@ class KeywordEmbedder:
     def load_cache(self) -> None:
         meta_path, emb_path = self._cache_paths()
         if not (os.path.exists(meta_path) and os.path.exists(emb_path)):
-            raise FileNotFoundError("Embedding cache not found. Run build_cache() first.")
+            raise FileNotFoundError("Keyword embedding cache not found. Run build_cache() first.")
 
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
@@ -177,11 +201,15 @@ class KeywordEmbedder:
 
     def ensure_loaded(self) -> None:
         if self._kw_emb is None:
-            # try load; if not found, build
             try:
                 self.load_cache()
             except FileNotFoundError:
                 self.build_cache()
+
+    def encode_query(self, text: str) -> np.ndarray:
+        model = self._load_model()
+        vec = model.encode([text], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+        return vec[0]
 
     def match(self, query: str, top_k: int = 8, threshold: float = 0.45) -> List[KeywordMatch]:
         self.ensure_loaded()
@@ -191,11 +219,9 @@ class KeywordEmbedder:
         if not q:
             return []
 
-        model = self._load_model()
-        q_emb = model.encode([q], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)[0]
-
-        scores = self._kw_emb @ q_emb  # cosine similarity (normalized)
-        idx = np.argsort(-scores)[: max(1, top_k)]
+        q_emb = self.encode_query(q)
+        scores = self._kw_emb @ q_emb
+        idx = np.argsort(-scores)[:max(1, top_k)]
 
         out: List[KeywordMatch] = []
         for i in idx:
@@ -206,7 +232,152 @@ class KeywordEmbedder:
 
 
 # -------------------------
-# Run as a script (build + quick test)
+# Product description embedder
+# -------------------------
+
+@dataclass(frozen=True)
+class ProductSemanticHit:
+    product_id: int
+    score: float
+
+
+class ProductDescriptionEmbedder:
+    """
+    Builds, stores, loads, and searches product-description embeddings.
+    Embeddings and metadata are saved into data/.
+    """
+    def __init__(
+        self,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        data_dir: str = "data",
+    ) -> None:
+        self.model_name = model_name
+        self.data_dir = data_dir
+
+        self._model: Optional[SentenceTransformer] = None
+        self.product_ids: List[int] = []
+        self.product_texts: List[str] = []
+        self.product_embs: Optional[np.ndarray] = None
+
+    def _load_model(self) -> SentenceTransformer:
+        if self._model is None:
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    def _cache_paths(self) -> Tuple[str, str]:
+        os.makedirs(self.data_dir, exist_ok=True)
+        safe_name = self.model_name.replace("/", "__")
+        meta_path = os.path.join(self.data_dir, f"product_desc_meta__{safe_name}.json")
+        emb_path = os.path.join(self.data_dir, f"product_desc_emb__{safe_name}.npy")
+        return meta_path, emb_path
+
+    def encode_texts(self, texts: List[str]) -> np.ndarray:
+        model = self._load_model()
+        emb = model.encode(
+            texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ).astype(np.float32)
+        return emb
+
+    def build_from_db(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, name, gender, description
+            FROM products
+            ORDER BY id
+            """
+        ).fetchall()
+
+        ids: List[int] = []
+        texts: List[str] = []
+
+        for row in rows:
+            text = build_product_text(
+                row["name"],
+                row["gender"],
+                row["description"],
+            )
+            if not text:
+                continue
+            ids.append(int(row["id"]))
+            texts.append(text)
+
+        self.product_ids = ids
+        self.product_texts = texts
+        self.product_embs = self.encode_texts(texts) if texts else None
+
+    def save_cache(self) -> None:
+        if self.product_embs is None:
+            raise ValueError("No product embeddings to save. Run build_from_db() first.")
+
+        meta_path, emb_path = self._cache_paths()
+
+        meta = {
+            "model_name": self.model_name,
+            "count": len(self.product_ids),
+            "product_ids": self.product_ids,
+            "product_texts": self.product_texts,
+        }
+
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        np.save(emb_path, self.product_embs.astype(np.float32))
+
+    def load_cache(self) -> None:
+        meta_path, emb_path = self._cache_paths()
+        if not (os.path.exists(meta_path) and os.path.exists(emb_path)):
+            raise FileNotFoundError("Product description cache not found. Run build_from_db() + save_cache() first.")
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        self.product_ids = [int(x) for x in meta["product_ids"]]
+        self.product_texts = list(meta["product_texts"])
+        self.product_embs = np.load(emb_path).astype(np.float32)
+
+    def ensure_loaded(self, conn: Optional[sqlite3.Connection] = None) -> None:
+        if self.product_embs is not None:
+            return
+
+        try:
+            self.load_cache()
+        except FileNotFoundError:
+            if conn is None:
+                raise FileNotFoundError(
+                    "Product description cache not found and no DB connection was provided to rebuild it."
+                )
+            self.build_from_db(conn)
+            self.save_cache()
+
+    def rebuild_cache(self, conn: sqlite3.Connection) -> None:
+        self.build_from_db(conn)
+        self.save_cache()
+
+    def search(self, query: str, top_k: int = 50) -> List[ProductSemanticHit]:
+        self.ensure_loaded()
+        assert self.product_embs is not None
+
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+
+        q_emb = self.encode_texts([q])[0]
+        scores = self.product_embs @ q_emb
+        idx = np.argsort(-scores)[:max(1, top_k)]
+
+        out: List[ProductSemanticHit] = []
+        for i in idx:
+            out.append(ProductSemanticHit(
+                product_id=int(self.product_ids[int(i)]),
+                score=float(scores[int(i)])
+            ))
+        return out
+
+
+# -------------------------
+# Run as a script
 # -------------------------
 if __name__ == "__main__":
     emb = KeywordEmbedder(
@@ -215,18 +386,5 @@ if __name__ == "__main__":
         normalize_map=NORMALIZE,
         keywords=DOMAIN_KEYWORDS,
     )
-
     emb.build_cache()
     print("Built keyword embedding cache.")
-
-    tests = [
-        "I want a heavy jacket for cold winter",
-        "Need something waterproof for rain",
-        "packable travel jacket",
-        "fur hood parka",
-        "TEI 4 warmest for extreme cold",
-    ]
-    for t in tests:
-        matches = emb.match(t, top_k=8, threshold=0.42)
-        print("\nQuery:", t)
-        print("Matches:", [(m.token, round(m.score, 3)) for m in matches])
