@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from embedder import KeywordEmbedder, DOMAIN_KEYWORDS, ProductDescriptionEmbedder
+from .embedder import KeywordEmbedder, DOMAIN_KEYWORDS, ProductDescriptionEmbedder
 
 DB_PATH = "data/canada_goose.db"
 

@@ -1,0 +1,52 @@
+BATCH EVALUATION OUTPUT
+
+TEST CASE 1
+================================================================================
+PROMPT: I want a men's waterproof windproof jacket for Alaska under 2000 dollars, TEI 5, for extreme cold, with down parka styling.
+FALLBACK_USED: False
+MISSING_SLOTS: []
+STATE: {'price_min': 0.0, 'price_max': 2000.0, 'gender': 'men', 'tei': 5, 'use_case': 'extreme_cold', 'waterproof': True, 'windproof': True, 'keywords': ['down', 'parka']}
+MAPPING: [('down', 'down', 1.0), ('parka', 'parka', 1.0)]
+
+RESULTS:
+1) Canada Goose Men's Lodge Jacket - Updated — $825 USD — score 0.684
+   https://www.escapeoutdoors.com/canada-goose-men-s-lodge-jacket-updated/
+2) Canada Goose Men's Lodge Hoody — $875 USD — score 0.682
+   https://www.escapeoutdoors.com/canada-goose-mens-lodge-hoody/
+3) Canada Goose Men's Lodge Jacket Black Label — $825 USD — score 0.678
+   https://www.escapeoutdoors.com/canada-goose-mens-lodge-jacket-black-label/
+4) Canada Goose Men's Wyndham Parka - Updated — $1395 USD — score 0.532
+   https://www.escapeoutdoors.com/canada-goose-men-s-wyndham-parka-updated/
+5) Canada Goose Men's Rupert Rain Jacket Black Label — $750 USD — score 0.526
+   https://www.escapeoutdoors.com/canada-goose-men-s-rupert-rain-jacket-black-label/
+
+TEST CASE 2
+================================================================================
+PROMPT: I want a women's everyday jacket under 900 dollars, lightweight and suitable for travel.
+FALLBACK_USED: False
+MISSING_SLOTS: []
+STATE: {'price_min': 0.0, 'price_max': 900.0, 'gender': 'women', 'tei': None, 'use_case': 'travel', 'waterproof': None, 'windproof': None, 'keywords': ['everyday', 'travel']}
+MAPPING: [('everyday', 'everyday', 1.0), ('travel', 'travel', 1.0)]
+
+RESULTS:
+1) Canada Goose Women's Davie Jacket — $595 USD — score 0.697
+   https://www.escapeoutdoors.com/canada-goose-womens-davie-jacket/
+2) Canada Goose Women's Minden Jacket — $595 USD — score 0.693
+   https://www.escapeoutdoors.com/canada-goose-womens-minden-jacket/
+3) Canada Goose Women's Ellison Jacket — $895 USD — score 0.686
+   https://www.escapeoutdoors.com/canada-goose-womens-ellison-jacket/
+4) Canada Goose Women's Salida Jacket — $650 USD — score 0.684
+   https://www.escapeoutdoors.com/canada-goose-womens-salida-jacket/
+5) Canada Goose Women's Hybridge Knit Jacket — $695 USD — score 0.684
+   https://www.escapeoutdoors.com/canada-goose-womens-hybridge-knit-jacket/
+
+TEST CASE 3
+================================================================================
+PROMPT: I want a unisex rain jacket under 1200 dollars, waterproof and windproof, for school commuting.
+FALLBACK_USED: False
+MISSING_SLOTS: []
+STATE: {'price_min': None, 'price_max': 1200.0, 'gender': 'unisex', 'tei': None, 'use_case': 'school', 'waterproof': True, 'windproof': True, 'keywords': ['rain', 'jacket']}
+MAPPING: [('rain', 'rain', 1.0), ('jacket', 'jacket', 1.0)]
+
+RESULTS:
+No results (after filters). Try removing constraints or changing wording.
